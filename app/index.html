@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>make.fun bounties</title>
+<meta name="description" content="A fast frontend for make.fun: live bounty board, bounty pages, leaderboards and public profiles, straight from the public API.">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="main.js"></script>
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/"><span class="mark">make.fun</span> <span class="tag">bounties</span></a>
+  <nav class="topnav">
+    <a href="#/">Board</a>
+    <a href="#/bounty/makefun-frontend-01">This bounty</a>
+    <a href="#/profile/golden-marten-16">Example profile</a>
+  </nav>
+</header>
+<main id="app"><p class="loading">Loading bounties…</p></main>
+<footer class="foot">
+  <p>Live data from <a href="https://make.fun" target="_blank" rel="noopener">make.fun</a>’s public API. Read-only: no sign-in, no writes. A bounty past its deadline is shown as ended even when its status still reads open.</p>
+</footer>
+<noscript><p class="error">This frontend needs JavaScript to read the make.fun API.</p></noscript>
+</body>
+</html>
