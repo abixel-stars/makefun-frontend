@@ -3,25 +3,25 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="A fast, read-only frontend for make.fun bounties: live board, bounty pages, leaderboards and public profiles.">
 <title>make.fun bounties</title>
-<meta name="description" content="A fast frontend for make.fun: live bounty board, bounty pages, leaderboards and public profiles, straight from the public API.">
-<link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
 <script type="module" src="main.js"></script>
 </head>
 <body>
-<header class="top">
-  <a class="brand" href="#/"><span class="mark">make.fun</span> <span class="tag">bounties</span></a>
-  <nav class="topnav">
-    <a href="#/">Board</a>
-    <a href="#/bounty/makefun-frontend-01">This bounty</a>
-    <a href="#/profile/golden-marten-16">Example profile</a>
-  </nav>
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <a class="brand" href="#/">make<span class="brand-dot">.</span>fun <span class="brand-sub">bounties</span></a>
+    <nav class="topnav" aria-label="Sections">
+      <a href="#/" data-nav="board">Board</a>
+      <a href="#/bounty/makefun-frontend-01" data-nav="bounty">This bounty</a>
+    </nav>
+    <span class="live-pill" title="Reading make.fun's public API live"><span class="live-dot"></span>live</span>
+  </div>
 </header>
-<main id="app"><p class="loading">Loading bounties…</p></main>
-<footer class="foot">
-  <p>Live data from <a href="https://make.fun" target="_blank" rel="noopener">make.fun</a>’s public API. Read-only: no sign-in, no writes. A bounty past its deadline is shown as ended even when its status still reads open.</p>
+<main id="view" class="wrap" aria-live="polite"></main>
+<footer class="wrap foot">
+  <p>Unofficial read-only client. All data comes from make.fun's public API. No sign-in, no writes, nothing leaves your browser except API reads.</p>
 </footer>
-<noscript><p class="error">This frontend needs JavaScript to read the make.fun API.</p></noscript>
 </body>
 </html>

@@ -1,252 +1,204 @@
-// The four surfaces, each a function from API data to HTML. Every value that
-// came from the API is escaped by fmt.esc before it is placed, and every
-// link is a real route the router understands.
+// The four surfaces, each a function from API data to an HTML string.
+// Views never fetch and never touch the DOM: the router in main.js calls
+// them, drops the string into #view, and wires up the controls.
 
-import { esc, usd, whole, fullDate, left, isLive, winRate, bytes, shortAddr, shortDate } from './fmt.js';
+import { count, esc, money, percent, pot, shortAddr, shortDate, stamp, stillOpen, timeLeft } from './format.js';
+import { renderMd } from './md.js';
 
-// A tiny markdown reader for bounty descriptions and rules: headings,
-// bold, code, links and lists. Text is escaped first, markup second.
-export function md(text) {
-  const safe = esc(text ?? '');
-  const lines = safe.split('\n');
-  let out = '';
-  let list = false;
-  for (const line of lines) {
-    const h = line.match(/^#{1,3}\s+(.*)$/);
-    const item = line.match(/^[-*]\s+(.*)$/);
-    if (h) {
-      if (list) { out += '</ul>'; list = false; }
-      out += `<h3>${inline(h[1])}</h3>`;
-    } else if (item) {
-      if (!list) { out += '<ul>'; list = true; }
-      out += `<li>${inline(item[1])}</li>`;
-    } else if (line.trim() === '') {
-      if (list) { out += '</ul>'; list = false; }
-    } else {
-      if (list) { out += '</ul>'; list = false; }
-      out += `<p>${inline(line)}</p>`;
-    }
-  }
-  if (list) out += '</ul>';
-  return out;
+const API_ORIGIN = 'https://make.fun';
+
+function avatarUrl(path) {
+  if (!path) return '';
+  return path.startsWith('http') ? path : API_ORIGIN + path;
 }
 
-function inline(s) {
-  return s
-    .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>');
-}
-
-function avatar(url, name, size) {
-  // The API mixes absolute avatar URLs with paths rooted at make.fun.
-  if (url && url.startsWith('/')) url = `https://make.fun${url}`;
-  if (url) {
-    return `<img class="avatar" crossorigin="anonymous" src="${esc(url)}" alt="" width="${size}" height="${size}" loading="lazy" onerror="this.outerHTML='<span class=\\'avatar fallback\\'>${esc((name || '?')[0].toUpperCase())}</span>'">`;
-  }
-  return `<span class="avatar fallback">${esc((name || '?')[0].toUpperCase())}</span>`;
-}
-
-// Consecutive places paying the same amount collapse into one row:
-// {"1":100,"2":70,"3":50,"4":20,...} -> 1st $100, 2nd $70, 3rd $50, 4th-10th $20.
-export function rewardRows(rewards) {
-  const places = Object.keys(rewards || {})
-    .map((k) => [Number(k), Number(rewards[k])])
-    .filter(([p, v]) => Number.isFinite(p) && Number.isFinite(v))
-    .sort((a, b) => a[0] - b[0]);
-  const rows = [];
-  for (const [place, amount] of places) {
-    const last = rows[rows.length - 1];
-    if (last && last.amount === amount && last.end === place - 1) last.end = place;
-    else rows.push({ start: place, end: place, amount });
-  }
-  return rows
-    .map((r) => {
-      const label = r.start === r.end ? ordinal(r.start) : `${ordinal(r.start)}–${ordinal(r.end)}`;
-      return `<tr><td>${label}</td><td class="num">${usd(r.amount)}</td></tr>`;
-    })
-    .join('');
-}
-
-function ordinal(n) {
-  if (n === 1) return '1st';
-  if (n === 2) return '2nd';
-  if (n === 3) return '3rd';
-  return `${n}th`;
+function avatar(handle, image) {
+  const url = avatarUrl(image);
+  const initial = esc((handle || '?').slice(0, 1).toUpperCase());
+  if (!url) return `<span class="avatar-fallback" aria-hidden="true">${initial}</span>`;
+  return `<img class="avatar" crossorigin="anonymous" src="${esc(url)}" alt="" loading="lazy" onerror="this.outerHTML='<span class=&quot;avatar-fallback&quot; aria-hidden=&quot;true&quot;>${initial}</span>'">`;
 }
 
 function statusBadge(b) {
-  if (isLive(b)) {
-    const soon = new Date(b.deadline).getTime() - Date.now() < 86400000;
-    return `<span class="badge open${soon ? ' soon' : ''}">${soon ? 'Closing soon' : 'Open'}</span>`;
-  }
-  return '<span class="badge closed">Ended</span>';
+  if (!stillOpen(b)) return '<span class="badge closed">Entries closed</span>';
+  const ms = new Date(b.deadline).getTime() - Date.now();
+  if (ms < 48 * 3600000) return '<span class="badge soon">Closing soon</span>';
+  return '<span class="badge open">Open</span>';
 }
 
-function card(b) {
-  const live = isLive(b);
-  return `<article class="card">
-    <div class="card-top"><span class="cat">${esc(b.category || 'Bounty')}</span>${statusBadge(b)}</div>
-    <h2><a href="#/bounty/${encodeURIComponent(b.slug)}">${esc(b.title)}</a></h2>
-    <p class="summary">${esc(b.summary || '')}</p>
-    <dl class="stats">
-      <div><dt>Live pot</dt><dd class="pot">${usd(b.potUsd ?? b.rewardAmount)}</dd></div>
-      <div><dt>Entry fee</dt><dd>${b.entryFeeUsd ? usd(b.entryFeeUsd) : 'Free'}</dd></div>
-      <div><dt>Entries</dt><dd>${whole(b.submissionCount)}</dd></div>
-      <div><dt>Time left</dt><dd data-deadline="${esc(b.deadline)}" class="${live ? '' : 'ended'}">${left(b.deadline)}</dd></div>
-    </dl>
-  </article>`;
+function feeChip(b) {
+  return b.entryFeeUsd ? `<span class="chip">${money(b.entryFeeUsd)} entry fee</span>` : '';
 }
 
-export function cardsHtml(list) {
-  return list.map(card).join('') || '<p class="empty">No bounties match.</p>';
-}
+/* ---------------- board ---------------- */
 
-export function boardView(list, shown) {
-  const total = list.reduce((s, b) => s + (Number(b.potUsd ?? b.rewardAmount) || 0), 0);
-  const liveCount = list.filter(isLive).length;
+export function boardShell() {
   return `
-    <section class="board-head">
-      <h1>Open bounties</h1>
-      <p class="lede">${liveCount} taking entries · ${usd(total)} in live pots</p>
-    </section>
-    <div class="board-tools">
-      <label class="search">Search <input id="q" type="search" placeholder="Bounty title or slug…" autocomplete="off"></label>
-      <div class="chips" id="filters">
-        <button data-filter="open" class="chip on">Open</button>
-        <button data-filter="soon" class="chip">Ending soon</button>
-        <button data-filter="big" class="chip">Big pot $500+</button>
-        <button data-filter="closed" class="chip">Ended</button>
-      </div>
-      <label class="sort">Sort
-        <select id="sort">
-          <option value="deadline">Ending soonest</option>
-          <option value="pot">Biggest pot</option>
-          <option value="entries">Most entries</option>
-          <option value="new">Newest</option>
-        </select>
-      </label>
+  <div class="page-head">
+    <h1>Open bounties</h1>
+    <p class="summary">Live bounties on make.fun, with the reward as it stands now, the entry fee, the time left and the entries. Data refreshes from the public API as you browse.</p>
+  </div>
+  <div class="toolbar">
+    <div class="tabs" role="group" aria-label="Filter bounties">
+      <button class="tab" data-filter="open" aria-pressed="true">Open now</button>
+      <button class="tab" data-filter="soon" aria-pressed="false">Closing soon</button>
+      <button class="tab" data-filter="all" aria-pressed="false">All</button>
+      <button class="tab" data-filter="ended" aria-pressed="false">Ended</button>
     </div>
-    <div class="grid" id="cards">${cardsHtml(shown)}</div>
-    <p class="more"><button id="more" class="btn">Show more</button></p>`;
+    <input class="search" id="board-search" type="search" placeholder="Search bounties…" aria-label="Search bounties">
+    <select class="sort" id="board-sort" aria-label="Sort bounties">
+      <option value="pot">Biggest pot</option>
+      <option value="deadline">Closing soonest</option>
+      <option value="entries">Most entries</option>
+      <option value="newest">Newest</option>
+    </select>
+  </div>
+  <div id="board-list"></div>
+  <div class="more-row"><button class="btn" id="board-more">Show more</button></div>`;
 }
 
-export function bountyView(b) {
-  const live = isLive(b);
+export function boardList(items) {
+  if (!items.length) return '<p class="empty">No bounties match this filter.</p>';
+  const rows = items
+    .map(
+      (b) => `
+      <li class="card">
+        <div class="card-title"><a href="#/bounty/${encodeURIComponent(b.slug)}">${esc(b.title)}</a></div>
+        <div class="card-pot">
+          <div class="pot-value">${pot(b)}</div>
+          <div class="pot-label">live pot</div>
+        </div>
+        <div class="card-meta">
+          ${statusBadge(b)}
+          <span class="chip">${esc(b.category || 'Bounty')}</span>
+          ${feeChip(b)}
+          <span class="countdown" data-deadline="${esc(b.deadline)}">${timeLeft(b.deadline)}</span>
+          <span>${count(b.submissionCount)} ${b.submissionCount === 1 ? 'entry' : 'entries'}</span>
+          <span>closes ${shortDate(b.deadline)}</span>
+        </div>
+      </li>`,
+    )
+    .join('');
+  return `<ul class="board">${rows}</ul>`;
+}
+
+/* ---------------- bounty page ---------------- */
+
+function rewardsTable(b) {
+  const now = Array.isArray(b.rewardsNow) && b.rewardsNow.length ? b.rewardsNow : null;
+  if (now) {
+    const rows = now
+      .map(
+        (r) => `<tr><td>${r.place}${r.place === 1 ? 'st' : r.place === 2 ? 'nd' : r.place === 3 ? 'rd' : 'th'}</td><td class="num">${money(r.baseUsd)}</td><td class="num">${money(r.feeShareUsd)}</td><td class="num"><strong>${money(r.amountUsd)}</strong></td></tr>`,
+      )
+      .join('');
+    return `<table><thead><tr><th>Place</th><th class="num">Reward</th><th class="num">Fee share</th><th class="num">Total now</th></tr></thead><tbody>${rows}</tbody></table>`;
+  }
+  const map = b.rewards || {};
+  const places = Object.keys(map).sort((a, c) => Number(a) - Number(c));
+  if (!places.length) return '<p class="muted">No reward table published for this bounty yet.</p>';
+  const rows = places
+    .map(
+      (p) => `<tr><td>${p}${p === '1' ? 'st' : p === '2' ? 'nd' : p === '3' ? 'rd' : 'th'}</td><td class="num"><strong>${money(map[p])}</strong></td></tr>`,
+    )
+    .join('');
+  return `<table><thead><tr><th>Place</th><th class="num">Reward</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+export function bountyPage(b) {
+  const skills = (b.skills || []).map((s) => `<span class="chip">${esc(s)}</span>`).join(' ');
   return `
-    <p class="crumbs"><a href="#/">← All bounties</a></p>
-    <header class="bounty-head">
-      <div>
-        <span class="cat">${esc(b.category || 'Bounty')}</span> ${statusBadge(b)}
-        <h1>${esc(b.title)}</h1>
-        <p class="lede">${esc(b.summary || '')}</p>
-      </div>
-    </header>
-    <dl class="stats big">
-      <div><dt>Live pot</dt><dd class="pot">${usd(b.potUsd ?? b.rewardAmount)}</dd></div>
-      <div><dt>Entry fee</dt><dd>${b.entryFeeUsd ? usd(b.entryFeeUsd) : 'Free'}</dd></div>
-      <div><dt>Entries</dt><dd>${whole(b.submissionCount)}</dd></div>
-      <div><dt>${live ? 'Closes in' : 'Deadline'}</dt><dd data-deadline="${esc(b.deadline)}">${live ? left(b.deadline) : fullDate(b.deadline)}</dd></div>
-      <div><dt>Opened</dt><dd>${shortDate(b.opensAt)}</dd></div>
-    </dl>
-    <p><a class="btn primary" href="#/bounty/${encodeURIComponent(b.slug)}/leaderboard">View leaderboard →</a></p>
-    <section>
-      <h2>Rewards</h2>
-      <table class="rewards"><thead><tr><th>Place</th><th>Prize</th></tr></thead>
-      <tbody>${rewardRows(b.rewards || {})}</tbody></table>
-      <p class="note">Entry fees paid join the pot, so the live pot above is what the places share.</p>
-    </section>
-    <section>
-      <h2>About this bounty</h2>
-      <div class="prose">${md(b.description || '')}</div>
-    </section>
-    ${b.rules ? `<section><details class="rules"><summary>Rules</summary><div class="prose">${md(b.rules)}</div></details></section>` : ''}`;
+  <div class="page-head">
+    <p class="crumbs"><a href="#/">All bounties</a> &rsaquo; ${esc(b.category || 'Bounty')}</p>
+    <h1>${esc(b.title)}</h1>
+    ${b.summary ? `<p class="summary">${esc(b.summary)}</p>` : ''}
+  </div>
+  <div class="stats">
+    <div class="stat"><div class="label">Live pot</div><div class="value amber">${pot(b)}</div><div class="sub">reward + entry fees paid</div></div>
+    <div class="stat"><div class="label">Entry fee</div><div class="value">${b.entryFeeUsd ? money(b.entryFeeUsd) : 'Free'}</div><div class="sub">${b.entryFeePayers ? `${count(b.entryFeePayers)} paid in` : 'no fee to enter'}</div></div>
+    <div class="stat"><div class="label">Time left</div><div class="value countdown" data-deadline="${esc(b.deadline)}">${timeLeft(b.deadline)}</div><div class="sub">closes ${stamp(b.deadline)}</div></div>
+    <div class="stat"><div class="label">Entries</div><div class="value">${count(b.submissionCount)}</div><div class="sub">opened ${shortDate(b.publishedAt)}</div></div>
+  </div>
+  <div class="toolbar">
+    <a class="btn primary" href="#/bounty/${encodeURIComponent(b.slug)}/leaderboard">Leaderboard</a>
+    <span class="muted small">${statusBadge(b)} &nbsp;Sponsor: ${esc(b.sponsor?.name || 'make.fun')}${b.sponsor?.isVerified ? ' ✓' : ''}</span>
+    ${skills}
+  </div>
+  <h2>Rewards</h2>
+  <div class="table-wrap">${rewardsTable(b)}</div>
+  ${b.description ? `<h2>About this bounty</h2><div class="prose">${renderMd(b.description)}</div>` : ''}`;
 }
 
-export function leaderboardView(slug, lb, rows, rankedTotal) {
-  const comp = lb.competition || {};
-  const phase = lb.phase || {};
-  const total = rankedTotal ?? rows.length;
-  const body = rows
+/* ---------------- leaderboard ---------------- */
+
+export function leaderboardPage(b, lb, view, page, perPage) {
+  const entries = lb.entries || [];
+  const total = entries.length;
+  const pages = Math.max(1, Math.ceil(total / perPage));
+  const slice = entries.slice((page - 1) * perPage, page * perPage);
+  const rows = slice
     .map((e) => {
-      const rate = e.values && e.values.judge != null ? winRate(e.values.judge) : '—';
-      const low = e.values && e.values.judge_low != null ? winRate(e.values.judge_low) : '';
-      const high = e.values && e.values.judge_high != null ? winRate(e.values.judge_high) : '';
-      const range = low && high ? `${low} – ${high}` : '—';
+      const rate = e.values ? percent(e.values.judge) : '—';
+      const low = e.values ? percent(e.values.judge_low) : '';
+      const high = e.values ? percent(e.values.judge_high) : '';
+      const wdl = e.judge ? `${e.judge.wins}W ${e.judge.draws}D ${e.judge.losses}L` : '—';
+      const frac = e.values ? Math.min(1, Math.max(0, Number(e.values.judge) / 1000000)) : 0;
       return `<tr>
-        <td class="num rank">${e.rank}</td>
-        <td><a class="entrant" href="#/profile/${encodeURIComponent(e.handle)}">${avatar(e.image, e.handle, 28)}<span>${esc(e.handle)}${e.house ? ' <em class="house">house</em>' : ''}</span></a>
-          <div class="entry-title">${esc(e.title || '')}</div></td>
-        <td class="num">${rate}</td>
-        <td class="num">${range}</td>
-        <td class="num">${e.values && e.values.valid != null ? e.values.valid : '—'}</td>
-        <td class="num">${bytes(e.values && e.values.bytes)}</td>
-        <td class="num">${e.prize_rank != null ? e.prize_rank : '—'}</td>
+        <td class="num"><strong>${e.rank}</strong></td>
+        <td class="row-link">${avatar(e.handle, e.image)}<a href="#/profile/${encodeURIComponent(e.handle)}">${esc(e.handle)}</a></td>
+        <td>${esc(e.title || '—')}</td>
+        <td class="num"><span class="rate">${rate}</span>${low ? `<span class="rate-bar"><i style="width:${Math.round(frac * 100)}%"></i></span><span class="small muted nowrap">${low} – ${high}</span>` : ''}</td>
+        <td class="num nowrap">${wdl}</td>
+        <td class="num">${e.values ? count(e.values.bytes) : '—'}</td>
       </tr>`;
     })
     .join('');
+  const otherView = view === 'overall' ? 'performance' : 'overall';
   return `
-    <p class="crumbs"><a href="#/bounty/${encodeURIComponent(slug)}">← ${esc(comp.title || slug)}</a></p>
-    <header class="board-head">
-      <h1>Leaderboard</h1>
-      <p class="lede">${esc(comp.title || slug)} · ${esc(phase.title || 'Development')} phase · top ${rows.length} of ${whole(total)} ranked</p>
-    </header>
-    <div class="board-tools">
-      <label class="sort">View
-        <select id="lbview">
-          <option value="performance">Performance</option>
-          <option value="overall">Overall</option>
-          <option value="cost">Cost</option>
-          <option value="efficiency">Efficiency</option>
-        </select>
-      </label>
-      <label class="search">Find an entrant <input id="lookup" type="search" placeholder="handle, e.g. golden-marten-16" autocomplete="off"></label>
-    </div>
-    ${rows.length ? `<table class="board-table">
-      <thead><tr><th>#</th><th>Entrant</th><th>Win rate</th><th>90% interval</th><th>Valid</th><th>Size</th><th>Prize</th></tr></thead>
-      <tbody>${body}</tbody></table>` : '<p class="empty">No ranked entries in this view yet.</p>'}
-    <p class="note">Win rate is the judge's pairwise rate. Ranks are decided on it; ties break on dossier size, then on who submitted first.</p>`;
+  <div class="page-head">
+    <p class="crumbs"><a href="#/">All bounties</a> &rsaquo; <a href="#/bounty/${encodeURIComponent(b.slug)}">${esc(b.title)}</a> &rsaquo; Leaderboard</p>
+    <h1>${esc(b.title)} — leaderboard</h1>
+    <p class="summary">${esc(lb.title || 'Results')} · phase: ${esc(lb.phase?.title || lb.phase?.key || '—')} · ${count(total)} ranked entries · view: ${esc(view)} (<a href="#/bounty/${encodeURIComponent(b.slug)}/leaderboard?view=${otherView}">switch to ${otherView}</a>)</p>
+  </div>
+  <div class="table-wrap"><table>
+    <thead><tr><th class="num">#</th><th>Entrant</th><th>Entry</th><th class="num">Judge win rate</th><th class="num">Games</th><th class="num">Size (bytes)</th></tr></thead>
+    <tbody>${rows || '<tr><td colspan="6" class="muted">No ranked entries yet.</td></tr>'}</tbody>
+  </table></div>
+  <div class="pager">
+    <span class="page-info">Page ${page} of ${pages}</span>
+    <button class="btn" id="lb-prev" ${page <= 1 ? 'disabled' : ''}>← Prev</button>
+    <button class="btn" id="lb-next" ${page >= pages ? 'disabled' : ''}>Next →</button>
+  </div>`;
 }
 
-export function profileView(p) {
+/* ---------------- profile ---------------- */
+
+export function profilePage(p) {
   const rec = p.record || {};
-  const sols = (p.solutions || [])
-    .map((s) => {
-      const c = s.competition || {};
-      return `<li class="solution">
-        <a href="#/bounty/${encodeURIComponent(c.slug)}">${esc(s.title || c.title || s.submission_id)}</a>
-        <span class="meta">${esc(c.title || '')} · entered ${shortDate(s.entered_at)}${s.placement ? ` · place ${s.placement}` : ''}${s.prize_usd ? ` · ${usd(s.prize_usd)}` : ''}</span>
-      </li>`;
-    })
-    .join('');
+  const name = p.display_name || p.handle;
+  const sols = (p.solutions || []).map((s) => {
+    const c = s.competition || {};
+    return `<li class="solution">
+      <h3><a href="#/bounty/${encodeURIComponent(c.slug || '')}">${esc(s.title || c.title || 'Untitled entry')}</a></h3>
+      <div class="meta">${esc(c.title || '')} · entered ${shortDate(s.entered_at)}${s.placement ? ` · placed #${s.placement}` : ''}${s.prize_usd ? ` · won ${money(s.prize_usd)}` : ''}${s.score?.display ? ` · score ${esc(s.score.display)}` : ''}</div>
+    </li>`;
+  }).join('');
   return `
-    <section class="profile-head">
-      ${avatar(p.image || p.avatar, p.handle, 72)}
-      <div>
-        <h1>${esc(p.display_name || p.handle)}</h1>
-        <p class="handle">@${esc(p.handle)}</p>
-        ${p.bio ? `<p class="lede">${esc(p.bio)}</p>` : ''}
-        <p class="meta">Joined ${shortDate(p.joined_at)}${p.wallet ? ` · wallet <a href="${esc(p.wallet.explorer_url || '')}" target="_blank" rel="noopener">${shortAddr(p.wallet.address)}</a>` : ''}</p>
-      </div>
-    </section>
-    <dl class="stats big">
-      <div><dt>Entered</dt><dd>${whole(rec.competitions_entered)}</dd></div>
-      <div><dt>Placed</dt><dd>${whole(rec.competitions_placed)}</dd></div>
-      <div><dt>Won</dt><dd>${whole(rec.competitions_won)}</dd></div>
-      <div><dt>Prize money</dt><dd>${usd(rec.prize_usd)}</dd></div>
-    </dl>
-    <section>
-      <h2>Entries</h2>
-      ${sols ? `<ul class="solutions">${sols}</ul>` : '<p class="empty">No entries yet.</p>'}
-    </section>`;
-}
-
-export function errorView(message) {
-  return `<p class="error">Could not load this page: ${esc(message)}</p>
-    <p><a class="btn" href="#/">Back to the board</a></p>`;
-}
-
-export function notFoundView(what) {
-  return `<h1>Not found</h1><p class="lede">No ${esc(what)} here.</p>
-    <p><a class="btn" href="#/">Back to the board</a></p>`;
+  <div class="profile-head">
+    ${avatar(p.handle, p.image || p.avatar)}
+    <div>
+      <h1>${esc(name)}</h1>
+      <p class="muted" style="margin:0">@${esc(p.handle)} · joined ${shortDate(p.joined_at)}</p>
+      ${p.bio ? `<p style="margin:6px 0 0">${esc(p.bio)}</p>` : ''}
+    </div>
+  </div>
+  ${p.wallet?.address ? `<p class="wallet">Wallet <a href="${esc(p.wallet.explorer_url || '')}" target="_blank" rel="noopener">${shortAddr(p.wallet.address)}</a></p>` : ''}
+  <div class="stats">
+    <div class="stat"><div class="label">Entered</div><div class="value">${count(rec.competitions_entered)}</div></div>
+    <div class="stat"><div class="label">Placed</div><div class="value">${count(rec.competitions_placed)}</div></div>
+    <div class="stat"><div class="label">Won</div><div class="value">${count(rec.competitions_won)}</div></div>
+    <div class="stat"><div class="label">Prize money</div><div class="value amber">${money(rec.prize_usd)}</div><div class="sub">${rec.best_placement ? `best place #${rec.best_placement}` : 'no placement yet'}</div></div>
+  </div>
+  <h2>Entries</h2>
+  ${sols ? `<ul class="solutions">${sols}</ul>` : '<p class="muted">No entries yet.</p>'}`;
 }

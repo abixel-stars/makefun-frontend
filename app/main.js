@@ -1,179 +1,203 @@
-// The router and the page lifecycle. Four hash routes:
+// Router and boot for the make.fun frontend.
 //
-//   #/                          the bounty board
-//   #/bounty/<slug>             one bounty
-//   #/bounty/<slug>/leaderboard that bounty's leaderboard
-//   #/profile/<handle>          an account's public profile
+// Hash routes (each is a link and its own address):
+//   #/                              the bounty board
+//   #/bounty/<slug>                 one bounty
+//   #/bounty/<slug>/leaderboard     that bounty's leaderboard (?view=overall)
+//   #/profile/<handle>              an account's public profile
 //
 // window.__shotReady is false while a route loads and true once its data is
 // on screen, so a screenshot script knows when to capture.
 
-import { openBounties, allBounties, oneBounty, bountyBoard, rankedTotal, account } from './api.js';
-import { boardView, cardsHtml, bountyView, leaderboardView, profileView, errorView, notFoundView } from './views.js';
-import { left, isLive } from './fmt.js';
+import * as api from './api.js';
+import { stillOpen, timeLeft } from './format.js';
+import { boardList, boardShell, bountyPage, leaderboardPage, profilePage } from './views.js';
 
-const app = document.getElementById('app');
-const PAGE = 12;
+const view = document.getElementById('view');
+let ticker = null;
+let boardCache = null;
+let boardAllCache = null;
 
-// Board state lives here, not in the URL: filtering, sorting and paging
-// re-render only the card grid, never the whole page.
-const boardState = { all: [], filter: 'open', sort: 'deadline', query: '', shown: PAGE };
-let boardLoaded = false;
-
-function route() {
-  const hash = location.hash || '#/';
-  const bounty = hash.match(/^#\/bounty\/([^/]+)(?:\/leaderboard)?\/?$/);
-  const board = hash.match(/^#\/bounty\/([^/]+)\/leaderboard\/?$/);
-  const profile = hash.match(/^#\/profile\/([^/]+)\/?$/);
-  if (board) return { view: 'leaderboard', slug: decodeURIComponent(board[1]) };
-  if (bounty) return { view: 'bounty', slug: decodeURIComponent(bounty[1]) };
-  if (profile) return { view: 'profile', handle: decodeURIComponent(profile[1]) };
-  return { view: 'board' };
+function loading() {
+  view.innerHTML = '<div class="loading">Loading live data from make.fun…</div>';
 }
 
-async function render() {
-  window.__shotReady = false;
-  const r = route();
-  try {
-    if (r.view === 'board') await showBoard();
-    else if (r.view === 'bounty') await showBounty(r.slug);
-    else if (r.view === 'leaderboard') await showLeaderboard(r.slug);
-    else await showProfile(r.handle);
-  } catch (err) {
-    app.innerHTML = errorView(err.message || 'something went wrong');
-  }
-  window.scrollTo(0, 0);
-  window.__shotReady = true;
+function failed(err) {
+  view.innerHTML = `<div class="error-box"><strong>Could not load this page.</strong><br>${err.message}<br><button class="btn" onclick="location.reload()">Retry</button></div>`;
 }
 
-function visibleBoard() {
-  const now = Date.now();
-  let list = boardState.all.slice();
-  if (boardState.filter === 'open') list = list.filter(isLive);
-  else if (boardState.filter === 'soon') list = list.filter((b) => isLive(b) && new Date(b.deadline).getTime() - now < 86400000);
-  else if (boardState.filter === 'big') list = list.filter((b) => Number(b.potUsd ?? b.rewardAmount) >= 500);
-  else if (boardState.filter === 'closed') list = list.filter((b) => !isLive(b));
-  if (boardState.query) {
-    const q = boardState.query.toLowerCase();
-    list = list.filter((b) => `${b.title} ${b.slug}`.toLowerCase().includes(q));
+/** Tick every countdown on screen once a second, by text only: the page is
+ *  never rebuilt for a ticking clock. */
+function startTicker() {
+  stopTicker();
+  ticker = setInterval(() => {
+    for (const el of view.querySelectorAll('[data-deadline]')) {
+      el.textContent = timeLeft(el.dataset.deadline);
+    }
+  }, 1000);
+}
+
+function stopTicker() {
+  if (ticker) clearInterval(ticker);
+  ticker = null;
+}
+
+function setActiveNav(route) {
+  for (const a of document.querySelectorAll('[data-nav]')) {
+    a.classList.toggle('active', a.dataset.nav === route);
   }
-  const by = boardState.sort;
-  list.sort((a, b) => {
-    if (by === 'pot') return (Number(b.potUsd ?? b.rewardAmount) || 0) - (Number(a.potUsd ?? a.rewardAmount) || 0);
-    if (by === 'entries') return (b.submissionCount || 0) - (a.submissionCount || 0);
-    if (by === 'new') return new Date(b.opensAt || 0) - new Date(a.opensAt || 0);
-    return new Date(a.deadline || 0) - new Date(b.deadline || 0);
+}
+
+/* ---------------- board ---------------- */
+
+const boardState = { filter: 'open', query: '', sort: 'pot', shown: 12 };
+const PAGE_SIZE = 12;
+
+function sortItems(items, sort) {
+  const arr = [...items];
+  if (sort === 'pot') arr.sort((a, b) => Number(b.potUsd ?? b.rewardAmount) - Number(a.potUsd ?? a.rewardAmount));
+  if (sort === 'deadline') arr.sort((a, b) => new Date(a.deadline) - new Date(b.deadline));
+  if (sort === 'entries') arr.sort((a, b) => (b.submissionCount || 0) - (a.submissionCount || 0));
+  if (sort === 'newest') arr.sort((a, b) => new Date(b.publishedAt || 0) - new Date(a.publishedAt || 0));
+  return arr;
+}
+
+function applyBoard() {
+  const all = boardState.filter === 'all' || boardState.filter === 'ended' ? boardAllCache : boardCache;
+  let items = (all || []).filter((b) => {
+    if (boardState.filter === 'open') return stillOpen(b);
+    if (boardState.filter === 'soon') return stillOpen(b) && new Date(b.deadline).getTime() - Date.now() < 48 * 3600000;
+    if (boardState.filter === 'ended') return !stillOpen(b);
+    return true;
   });
-  return list;
-}
-
-function paintCards() {
-  const list = visibleBoard();
-  const grid = document.getElementById('cards');
-  const more = document.getElementById('more');
-  if (!grid) return;
-  // Only the grid is rebuilt; the tools, the search text and the page stay.
-  grid.innerHTML = cardsHtml(list.slice(0, boardState.shown));
-  if (more) more.style.display = list.length > boardState.shown ? '' : 'none';
+  const q = boardState.query.trim().toLowerCase();
+  if (q) items = items.filter((b) => `${b.title} ${b.slug} ${b.category || ''}`.toLowerCase().includes(q));
+  items = sortItems(items, boardState.sort);
+  const list = document.getElementById('board-list');
+  if (list) list.innerHTML = boardList(items.slice(0, boardState.shown));
+  const more = document.getElementById('board-more');
+  if (more) more.style.display = items.length > boardState.shown ? '' : 'none';
 }
 
 async function showBoard() {
+  setActiveNav('board');
   document.title = 'make.fun bounties';
-  if (!boardLoaded) {
-    app.innerHTML = '<p class="loading">Loading bounties…</p>';
-    boardState.all = await openBounties();
-    boardLoaded = true;
-  }
-  app.innerHTML = boardView(boardState.all, visibleBoard().slice(0, boardState.shown));
-  const more = document.getElementById('more');
-  if (more) more.style.display = visibleBoard().length > boardState.shown ? '' : 'none';
-
-  document.getElementById('q').addEventListener('input', (e) => {
-    boardState.query = e.target.value.trim();
-    boardState.shown = PAGE;
-    paintCards();
-  });
-  document.getElementById('filters').addEventListener('click', async (e) => {
-    const btn = e.target.closest('[data-filter]');
-    if (!btn) return;
-    document.querySelectorAll('#filters .chip').forEach((c) => c.classList.remove('on'));
-    btn.classList.add('on');
-    boardState.filter = btn.dataset.filter;
-    boardState.shown = PAGE;
-    if (boardState.filter === 'closed' && !boardState.all.some((b) => !isLive(b))) {
-      boardState.all = await allBounties();
-    }
-    paintCards();
-  });
-  document.getElementById('sort').addEventListener('change', (e) => {
-    boardState.sort = e.target.value;
-    boardState.shown = PAGE;
-    paintCards();
-  });
-  more.addEventListener('click', () => {
-    boardState.shown += PAGE;
-    paintCards();
-  });
-}
-
-async function showBounty(slug) {
-  app.innerHTML = '<p class="loading">Loading bounty…</p>';
-  const b = await oneBounty(slug);
-  if (!b || !b.slug) {
-    app.innerHTML = notFoundView(`bounty “${slug}”`);
-    return;
-  }
-  document.title = `${b.title} | make.fun bounties`;
-  app.innerHTML = bountyView(b);
-}
-
-async function showLeaderboard(slug) {
-  app.innerHTML = '<p class="loading">Loading leaderboard…</p>';
-  const [lb, total] = await Promise.all([bountyBoard(slug), rankedTotal(slug)]);
-  document.title = `Leaderboard · ${lb.competition?.title || slug} | make.fun bounties`;
-  app.innerHTML = leaderboardView(slug, lb, lb.entries || [], total);
-  const view = document.getElementById('lbview');
-  if (view) {
-    view.addEventListener('change', async () => {
-      window.__shotReady = false;
-      const next = await bountyBoard(slug, view.value);
-      app.innerHTML = leaderboardView(slug, next, next.entries || [], total);
-      document.getElementById('lbview').value = view.value;
-      wireLookup();
+  view.innerHTML = boardShell();
+  if (!boardCache) {
+    try {
+      const data = await api.listOpen();
+      boardCache = data.items || [];
+    } catch (err) {
+      failed(err);
       window.__shotReady = true;
+      return;
+    }
+  }
+  for (const tab of view.querySelectorAll('.tab')) {
+    tab.addEventListener('click', async () => {
+      boardState.filter = tab.dataset.filter;
+      boardState.shown = PAGE_SIZE;
+      for (const t of view.querySelectorAll('.tab')) t.setAttribute('aria-pressed', String(t === tab));
+      if ((boardState.filter === 'all' || boardState.filter === 'ended') && !boardAllCache) {
+        try {
+          boardAllCache = (await api.listAll()).items || [];
+        } catch (err) {
+          failed(err);
+          return;
+        }
+      }
+      applyBoard();
     });
   }
-  wireLookup();
+  view.querySelector('#board-search').addEventListener('input', (e) => {
+    boardState.query = e.target.value;
+    boardState.shown = PAGE_SIZE;
+    applyBoard();
+  });
+  view.querySelector('#board-sort').addEventListener('change', (e) => {
+    boardState.sort = e.target.value;
+    applyBoard();
+  });
+  view.querySelector('#board-more').addEventListener('click', () => {
+    boardState.shown += PAGE_SIZE;
+    applyBoard();
+  });
+  applyBoard();
+  startTicker();
+  window.__shotReady = true;
 }
 
-function wireLookup() {
-  const box = document.getElementById('lookup');
-  if (!box) return;
-  box.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && box.value.trim()) {
-      location.hash = `#/profile/${encodeURIComponent(box.value.trim())}`;
-    }
-  });
+/* ---------------- bounty + leaderboard + profile ---------------- */
+
+async function showBounty(slug) {
+  setActiveNav('bounty');
+  loading();
+  try {
+    const b = await api.bounty(slug);
+    document.title = `${b.title} | make.fun bounties`;
+    view.innerHTML = bountyPage(b);
+    startTicker();
+  } catch (err) {
+    failed(err);
+  }
+  window.__shotReady = true;
+}
+
+async function showLeaderboard(slug, query) {
+  setActiveNav('bounty');
+  loading();
+  const params = new URLSearchParams(query);
+  const lbView = params.get('view') === 'overall' ? 'overall' : 'performance';
+  let page = Number(params.get('page') || 1);
+  if (!Number.isInteger(page) || page < 1) page = 1;
+  const perPage = 25;
+  try {
+    const [b, lb] = await Promise.all([api.bounty(slug), api.leaderboard(slug, lbView)]);
+    document.title = `${b.title} leaderboard | make.fun bounties`;
+    view.innerHTML = leaderboardPage(b, lb, lbView, page, perPage);
+    const go = (p) => {
+      location.hash = `#/bounty/${encodeURIComponent(slug)}/leaderboard?view=${lbView}&page=${p}`;
+    };
+    view.querySelector('#lb-prev')?.addEventListener('click', () => go(page - 1));
+    view.querySelector('#lb-next')?.addEventListener('click', () => go(page + 1));
+  } catch (err) {
+    failed(err);
+  }
+  window.__shotReady = true;
 }
 
 async function showProfile(handle) {
-  app.innerHTML = '<p class="loading">Loading profile…</p>';
-  const p = await account(handle);
-  if (!p || !p.handle) {
-    app.innerHTML = notFoundView(`profile “${handle}”`);
-    return;
+  setActiveNav('');
+  loading();
+  try {
+    const p = await api.profile(handle);
+    document.title = `@${p.handle} | make.fun bounties`;
+    view.innerHTML = profilePage(p);
+  } catch (err) {
+    failed(err);
   }
-  document.title = `@${p.handle} | make.fun bounties`;
-  app.innerHTML = profileView(p);
+  window.__shotReady = true;
 }
 
-// The countdowns tick in place every 30 seconds: the numbers move, the
-// page is not rebuilt.
-setInterval(() => {
-  document.querySelectorAll('[data-deadline]').forEach((el) => {
-    el.textContent = left(el.dataset.deadline);
-  });
-}, 30000);
+/* ---------------- route ---------------- */
+
+async function render() {
+  window.__shotReady = false;
+  stopTicker();
+  const hash = location.hash || '#/';
+  const [path, query = ''] = hash.slice(2).split('?');
+  const parts = path.split('/').filter(Boolean);
+  if (parts[0] === 'bounty' && parts[1] && parts[2] === 'leaderboard') {
+    await showLeaderboard(decodeURIComponent(parts[1]), query);
+  } else if (parts[0] === 'bounty' && parts[1]) {
+    await showBounty(decodeURIComponent(parts[1]));
+  } else if (parts[0] === 'profile' && parts[1]) {
+    await showProfile(decodeURIComponent(parts[1]));
+  } else {
+    await showBoard();
+  }
+  window.scrollTo(0, 0);
+}
 
 window.addEventListener('hashchange', render);
 render();

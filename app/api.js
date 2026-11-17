@@ -1,80 +1,63 @@
-// Live read-only access to make.fun's public API, with a small honest cache.
+// Read-only client for make.fun's public API.
 //
-// The API's ETags are bound to the minute: a revalidation inside the same
-// minute answers 304, and once the minute turns it answers 200 with a new tag
-// even when nothing changed. So this cache keeps an answer in memory while it
-// is fresh, revalidates with If-None-Match when it ages out, and never asks
-// twice for the same thing at the same time.
+// Every answer is cached in memory with the ETag the API sent. The API binds
+// its ETags to the minute, so a revalidation inside the same minute answers
+// 304 and costs almost nothing; once the minute turns we get a fresh 200.
+// Requests already in flight for the same path share one promise.
 
 const BASE = 'https://make.fun/api';
-const FRESH_MS = 55000;
 
-const kept = new Map(); // url -> { tag, body, stamp }
-const flying = new Map(); // url -> Promise
+const cache = new Map();
+const inflight = new Map();
 
 async function request(path) {
-  const url = BASE + path;
-  const hit = kept.get(url);
-  if (hit && Date.now() - hit.stamp < FRESH_MS) return hit.body;
-  if (flying.has(url)) return flying.get(url);
-
+  const pending = inflight.get(path);
+  if (pending) return pending;
   const job = (async () => {
+    const slot = cache.get(path);
     const headers = {};
-    if (hit && hit.tag) headers['If-None-Match'] = hit.tag;
-    const res = await fetch(url, { headers, cache: 'no-store' });
-    if (res.status === 304 && hit) {
-      hit.stamp = Date.now();
-      return hit.body;
+    if (slot && slot.etag) headers['If-None-Match'] = slot.etag;
+    const res = await fetch(BASE + path, { headers });
+    if (res.status === 304 && slot) return slot.data;
+    if (!res.ok) {
+      const err = new Error(`make.fun API ${res.status} for ${path}`);
+      err.status = res.status;
+      throw err;
     }
-    if (!res.ok) throw new Error(`make.fun answered ${res.status} for ${path}`);
-    const body = await res.json();
-    kept.set(url, { tag: res.headers.get('etag'), body, stamp: Date.now() });
-    return body;
+    const data = await res.json();
+    cache.set(path, { etag: res.headers.get('ETag'), data });
+    return data;
   })();
-
-  flying.set(url, job);
+  inflight.set(path, job);
   try {
     return await job;
   } finally {
-    flying.delete(url);
+    inflight.delete(path);
   }
 }
 
-// The list endpoints answer either a bare array or an object with items.
-function asList(doc) {
-  if (Array.isArray(doc)) return doc;
-  if (Array.isArray(doc && doc.items)) return doc.items;
-  if (Array.isArray(doc && doc.competitions)) return doc.competitions;
-  return [];
+/** The live bounty board (open bounties with their activity times). */
+export function listOpen() {
+  return request('/competitions?status=open&activity=times');
 }
 
-export function openBounties() {
-  return request('/competitions?status=open&activity=times').then(asList);
+/** Every bounty, open or finished, for the board's "All" filter. */
+export function listAll() {
+  return request('/competitions?activity=times');
 }
 
-export function allBounties() {
-  return request('/competitions?activity=times').then(asList);
-}
-
-export function oneBounty(slug) {
+/** One bounty, by slug. */
+export function bounty(slug) {
   return request(`/competitions/${encodeURIComponent(slug)}`);
 }
 
-export function bountyBoard(slug, view) {
-  // The leaderboard answers the whole ranking at once (thousands of rows),
-  // so ask for the first page only: the top 10 by rank. One request, cached.
-  const q = view ? `?rows=first&view=${encodeURIComponent(view)}` : '?rows=first';
-  return request(`/competitions/${encodeURIComponent(slug)}/leaderboard${q}`);
+/** A bounty's leaderboard. view is "performance" or "overall". */
+export function leaderboard(slug, view) {
+  const v = view === 'overall' ? 'overall' : 'performance';
+  return request(`/competitions/${encodeURIComponent(slug)}/leaderboard?view=${v}`);
 }
 
-// How many entries a bounty has ranked, from the submissions endpoint's
-// own count (a limit=1 call, so the payload stays tiny).
-export function rankedTotal(slug) {
-  return request(`/competitions/${encodeURIComponent(slug)}/submissions?limit=1`).then(
-    (d) => d.ranked ?? null,
-  );
-}
-
-export function account(handle) {
+/** An account's public profile, by handle. */
+export function profile(handle) {
   return request(`/profiles/${encodeURIComponent(handle)}`);
 }
